@@ -1,0 +1,71 @@
+# Personal Claude data
+SERPROFILE/
+.claude/
+.claude-*/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database and backups
+*.db
+*.sqlite
+*.sqlite3
+*.backup
+*.backup.*
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Uploads
+backend/uploads/
+
+# Development-only files
+*_REPORT.md
+*_SUMMARY.md
+*_PLAN.md
+SUBMISSION_DRAFT.md
+workflow/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old Git history backup — never publish
+.git-old-backup/
+
+# SQLite databases and backups
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite.*
+*.backup*
+
+# Personal Claude data
+SERPROFILE/
+.claude/
+.claude-*/
+
+# Environment files
+.env
+.env.*
+!.env.example
