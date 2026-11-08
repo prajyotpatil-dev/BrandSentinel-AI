@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import DocumentModel
 from app.services.document_processor import DocumentProcessor
+from app.services.cloudinary_storage import upload_document, delete_document
 
 
 # File signature magic bytes for validation
@@ -298,77 +299,74 @@ class UploadService:
         temp_dir: Optional[Path] = None
     ) -> DocumentModel:
         """
-        Process file upload end-to-end.
+        Validate, store, and process an uploaded document.
 
-        Steps:
-        1. Validate filename, extension, MIME type
-        2. Stream file to temporary location with size enforcement
-        3. Validate file signature
-        4. Generate server-side filename
-        5. Create database record
-        6. Move file to final location
-        7. Invoke document processor
-        8. Cleanup on failure
-
-        Args:
-            file: FastAPI UploadFile
-            title: Optional document title
-            category: Document category
-            tags: Optional tags list
-            db: Database session
-            temp_dir: Optional temp directory (for testing)
-
-        Returns:
-            Created DocumentModel
-
-        Raises:
-            HTTPException: On validation or processing failures
+        Local mode stores the permanent file on the local filesystem.
+        Cloudinary mode stores the permanent file remotely but processes
+        the temporary local copy. The document processor always receives
+        a local Path.
         """
+
         original_filename = file.filename or "untitled"
         content_type = file.content_type or ""
 
-        # Validate original filename
         valid, error = self.validate_filename(original_filename)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
 
-        # Validate extension
         valid, error = self.validate_extension(original_filename)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
 
-        # Validate MIME type
         valid, error = self.validate_mime_type(content_type)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
 
-        # Save to temporary location with size enforcement
         temp_path, file_size = await self.save_upload(file, temp_dir)
 
+        document = None
+        cloudinary_public_id = None
+        backend = settings.storage_backend.strip().lower()
+
         try:
-            # Validate file signature
             valid, error = self.validate_file_signature(temp_path, content_type)
             if not valid:
                 raise HTTPException(status_code=400, detail=error)
 
-            # Generate server-side filename
             storage_filename = self.generate_storage_filename(original_filename)
-            storage_path = self.get_storage_path(storage_filename)
 
-            # Ensure storage path doesn't exist (prevent collisions)
-            if storage_path.exists():
-                # UUID collision is extremely unlikely, but handle it
-                storage_filename = self.generate_storage_filename(original_filename)
+            if backend == "cloudinary":
+                result = upload_document(
+                    file_path=temp_path,
+                    public_id=storage_filename
+                )
+                cloudinary_public_id = result["public_id"]
+                storage_reference = cloudinary_public_id
+
+            elif backend == "local":
                 storage_path = self.get_storage_path(storage_filename)
 
-            # Create database record
+                if storage_path.exists():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Storage filename collision. Please retry."
+                    )
+
+                shutil.move(str(temp_path), str(storage_path))
+                storage_reference = storage_filename
+
+            else:
+                raise RuntimeError(
+                    f"Unsupported storage backend: {backend}"
+                )
+
             doc_id = str(uuid.uuid4())
             document = DocumentModel(
                 id=doc_id,
                 filename=original_filename,
                 file_type=content_type.split(";")[0].strip(),
                 file_size=file_size,
-                storage_path=storage_filename,  # Store relative path only
+                storage_path=storage_reference,
                 title=title or Path(original_filename).stem,
                 category=category,
                 status="uploading",
@@ -379,41 +377,57 @@ class UploadService:
             db.commit()
             db.refresh(document)
 
-            # Move file to final location atomically
-            shutil.move(str(temp_path), str(storage_path))
+            processing_path = (
+                temp_path
+                if backend == "cloudinary"
+                else self.get_storage_path(storage_filename)
+            )
 
-            # Invoke Phase 2 document processor
             processor = DocumentProcessor()
-            success, error_message = processor.process_and_persist(
+            processor.process_and_persist(
                 document_id=doc_id,
-                file_path=storage_path,
+                file_path=processing_path,
                 file_type=document.file_type,
                 db=db
             )
 
-            # Refresh to get updated status
             db.refresh(document)
-
             return document
 
         except HTTPException:
-            # Clean up temp file and database record
             temp_path.unlink(missing_ok=True)
-            if 'document' in locals():
+
+            if document is not None:
                 db.delete(document)
                 db.commit()
+
+            if cloudinary_public_id:
+                try:
+                    delete_document(cloudinary_public_id)
+                except Exception:
+                    pass
+
             raise
 
         except Exception as e:
-            # Clean up temp file and database record
             temp_path.unlink(missing_ok=True)
-            if 'document' in locals():
+
+            if document is not None:
                 db.delete(document)
                 db.commit()
+
+            if cloudinary_public_id:
+                try:
+                    delete_document(cloudinary_public_id)
+                except Exception:
+                    pass
+
             raise HTTPException(
                 status_code=500,
                 detail="Upload processing failed"
-            )
+            ) from e
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 upload_service = UploadService()

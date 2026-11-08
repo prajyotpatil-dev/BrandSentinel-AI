@@ -4,6 +4,9 @@ BrandSentinel AI — FastAPI Application Entry Point
 Hackathon: CodeNexus India 2026 — Round 2
 """
 import time
+import uuid
+from pathlib import Path
+from app.services.cloudinary_storage import download_document
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
@@ -60,8 +63,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -78,7 +81,7 @@ def health_check(db: Session = Depends(get_db)):
     ai_available = bool(settings.gemini_api_key)
     return HealthResponse(
         status="ok",
-        model="gemini-2.0-flash-exp" if ai_available else "fallback-deterministic",
+        model=settings.gemini_model if ai_available else "fallback-deterministic"   ,
         guideline_count=count,
         fallback_mode=not ai_available,
     )
@@ -548,59 +551,104 @@ def update_document(document_id: str, update: DocumentUpdate, db: Session = Depe
 @app.post("/api/documents/{document_id}/reprocess", tags=["Documents"])
 def reprocess_document(document_id: str, db: Session = Depends(get_db)):
     """
-    Reprocess an uploaded document.
+    Reprocess a document from local storage or Cloudinary.
 
-    - Reads the stored file and re-extracts text
-    - Deletes old chunks and creates new ones (no duplicates)
-    - Updates document status to "indexed" or "failed"
-    - Returns 404 if document not found or soft-deleted
-    - Returns 400 if file no longer exists on disk
+    Cloudinary files are downloaded to a temporary local file because
+    DocumentProcessor works with filesystem paths.
     """
     from app.schemas import DocumentReprocessResponse
     from app.services.document_processor import DocumentProcessor
-    from pathlib import Path
 
-    document = db.query(models.DocumentModel).filter_by(id=document_id).first()
+    document = db.query(models.DocumentModel).filter_by(
+        id=document_id
+    ).first()
 
     if not document or document.deleted_at is not None:
-        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found")
-
-    # Check if file exists
-    storage_path = settings.upload_storage_path / document.storage_path
-    if not storage_path.exists():
         raise HTTPException(
-            status_code=400,
-            detail="Source file no longer exists on disk. Cannot reprocess."
+            status_code=404,
+            detail=f"Document '{document_id}' not found"
         )
 
-    # Reprocess
-    processor = DocumentProcessor()
-    success, error_message = processor.process_and_persist(
-        document_id=document_id,
-        file_path=storage_path,
-        file_type=document.file_type,
-        db=db
-    )
+    backend = settings.storage_backend.strip().lower()
+    temporary_file = None
 
-    # Refresh to get updated status
-    db.refresh(document)
+    try:
+        if backend == "cloudinary":
+            temp_dir = settings.upload_storage_path / "temp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
 
-    chunk_count = db.query(models.DocumentChunkModel).filter_by(document_id=document_id).count()
+            suffix = Path(document.filename).suffix
+            temporary_file = temp_dir / f"reprocess_{uuid.uuid4()}{suffix}"
 
-    if success:
-        return DocumentReprocessResponse(
-            id=document.id,
-            status=document.status,
-            chunk_count=chunk_count,
-            message=f"Document reprocessed successfully. {chunk_count} chunks indexed."
+            storage_path = download_document(
+                document.storage_path,
+                temporary_file
+            )
+
+        elif backend == "local":
+            storage_path = (
+                settings.upload_storage_path / document.storage_path
+            )
+
+            if not storage_path.is_file():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Source file no longer exists on disk. "
+                        "Cannot reprocess."
+                    )
+                )
+
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unsupported storage backend: {backend}"
+            )
+
+        processor = DocumentProcessor()
+        success, error_message = processor.process_and_persist(
+            document_id=document_id,
+            file_path=storage_path,
+            file_type=document.file_type,
+            db=db
         )
-    else:
+
+        db.refresh(document)
+
+        chunk_count = db.query(
+            models.DocumentChunkModel
+        ).filter_by(document_id=document_id).count()
+
+        if success:
+            return DocumentReprocessResponse(
+                id=document.id,
+                status=document.status,
+                chunk_count=chunk_count,
+                message=(
+                    f"Document reprocessed successfully. "
+                    f"{chunk_count} chunks indexed."
+                )
+            )
+
         return DocumentReprocessResponse(
             id=document.id,
             status=document.status,
             chunk_count=chunk_count,
             message=f"Reprocessing failed: {error_message}"
         )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Document reprocessing failed."
+        ) from exc
+
+    finally:
+        if temporary_file is not None:
+            temporary_file.unlink(missing_ok=True)
 
 
 @app.delete("/api/documents/{document_id}", tags=["Documents"])
