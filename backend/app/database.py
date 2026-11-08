@@ -6,6 +6,20 @@ from app.config import settings
 
 database_url = settings.database_url
 
+# Explicitly use psycopg2 for PostgreSQL connections.
+if database_url.startswith("postgresql://"):
+    database_url = database_url.replace(
+        "postgresql://",
+        "postgresql+psycopg2://",
+        1
+    )
+elif database_url.startswith("postgresql+psycopg://"):
+    database_url = database_url.replace(
+        "postgresql+psycopg://",
+        "postgresql+psycopg2://",
+        1
+    )
+
 connect_args = {}
 
 if database_url.startswith("sqlite"):
